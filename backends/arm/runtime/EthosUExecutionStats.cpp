@@ -6,6 +6,7 @@
  */
 
 #include <algorithm>
+#include <array>
 
 #include <ethosu_driver.h>
 #include <pmu_ethosu.h>
@@ -32,14 +33,66 @@ void write_le64(uint8_t* destination, uint64_t value) {
 namespace executorch::backends::arm {
 namespace {
 std::atomic<EthosUStatsBuffer*> capture_buffer{nullptr};
+
+std::array<ethosu_pmu_event_type, 4> u55_u65_events = {
+    ETHOSU_PMU_AXI0_RD_DATA_BEAT_RECEIVED,
+    ETHOSU_PMU_AXI1_RD_DATA_BEAT_RECEIVED,
+    ETHOSU_PMU_AXI0_WR_DATA_BEAT_WRITTEN,
+    ETHOSU_PMU_NPU_IDLE,
+};
+
+std::array<ethosu_pmu_event_type, kMaxPmuEventCounters> u85_events = {
+    ETHOSU_PMU_SRAM_RD_DATA_BEAT_RECEIVED,
+    ETHOSU_PMU_SRAM_WR_DATA_BEAT_WRITTEN,
+    ETHOSU_PMU_EXT_RD_DATA_BEAT_RECEIVED,
+    ETHOSU_PMU_EXT_WR_DATA_BEAT_WRITTEN,
+    ETHOSU_PMU_NPU_IDLE,
+    ETHOSU_PMU_MAC_ACTIVE,
+    ETHOSU_PMU_WD_ACTIVE,
+    ETHOSU_PMU_NO_EVENT,
+};
+
+template <size_t N>
+void copy_pmu_events(
+    std::array<ethosu_pmu_event_type, N>& destination,
+    executorch::runtime::ArrayRef<ethosu_pmu_event_type> events) {
+  destination.fill(ETHOSU_PMU_NO_EVENT);
+  if (!events.empty()) {
+    std::copy_n(events.begin(), events.size(), destination.begin());
+  }
+}
 } // namespace
 
+// cppcheck-suppress unusedFunction
 EthosUStatsBuffer* set_ethosu_stats_buffer(EthosUStatsBuffer* buffer) noexcept {
   return capture_buffer.exchange(buffer, std::memory_order_acq_rel);
 }
 
+// cppcheck-suppress unusedFunction
 bool ethosu_execution_metrics_enabled() noexcept {
   return true;
+}
+
+// cppcheck-suppress unusedFunction
+executorch::runtime::Error set_ethosu55_65_pmu_events(
+    executorch::runtime::ArrayRef<ethosu_pmu_event_type> events) noexcept {
+  using executorch::runtime::Error;
+  if (events.size() > u55_u65_events.size()) {
+    return Error::InvalidArgument;
+  }
+  copy_pmu_events(u55_u65_events, events);
+  return Error::Ok;
+}
+
+// cppcheck-suppress unusedFunction
+executorch::runtime::Error set_ethosu85_pmu_events(
+    executorch::runtime::ArrayRef<ethosu_pmu_event_type> events) noexcept {
+  using executorch::runtime::Error;
+  if (events.size() > u85_events.size()) {
+    return Error::InvalidArgument;
+  }
+  copy_pmu_events(u85_events, events);
+  return Error::Ok;
 }
 
 } // namespace executorch::backends::arm
@@ -65,31 +118,15 @@ void ethosu_inference_begin(struct ethosu_driver* drv, void* user_arg) {
       || invocation->event_tracer != nullptr
 #endif
   ) {
-    static constexpr ethosu_pmu_event_type kU55U65Events[] = {
-        ETHOSU_PMU_AXI0_RD_DATA_BEAT_RECEIVED,
-        ETHOSU_PMU_AXI1_RD_DATA_BEAT_RECEIVED,
-        ETHOSU_PMU_AXI0_WR_DATA_BEAT_WRITTEN,
-        ETHOSU_PMU_NPU_IDLE,
-    };
-    static constexpr ethosu_pmu_event_type kU85Events[] = {
-        ETHOSU_PMU_SRAM_RD_DATA_BEAT_RECEIVED,
-        ETHOSU_PMU_SRAM_WR_DATA_BEAT_WRITTEN,
-        ETHOSU_PMU_EXT_RD_DATA_BEAT_RECEIVED,
-        ETHOSU_PMU_EXT_WR_DATA_BEAT_WRITTEN,
-        ETHOSU_PMU_NPU_IDLE,
-        ETHOSU_PMU_MAC_ACTIVE,
-        ETHOSU_PMU_WD_ACTIVE,
-    };
-
     const ethosu_pmu_event_type* events = nullptr;
     uint32_t event_count = 0;
     if (drv->dev.caps.product == ETHOSU_PRODUCT_U55 ||
         drv->dev.caps.product == ETHOSU_PRODUCT_U65) {
-      events = kU55U65Events;
-      event_count = sizeof(kU55U65Events) / sizeof(kU55U65Events[0]);
+      events = executorch::backends::arm::u55_u65_events.data();
+      event_count = executorch::backends::arm::u55_u65_events.size();
     } else if (drv->dev.caps.product == ETHOSU_PRODUCT_U85) {
-      events = kU85Events;
-      event_count = sizeof(kU85Events) / sizeof(kU85Events[0]);
+      events = executorch::backends::arm::u85_events.data();
+      event_count = executorch::backends::arm::u85_events.size();
     }
 
     if (events != nullptr) {
@@ -100,10 +137,15 @@ void ethosu_inference_begin(struct ethosu_driver* drv, void* user_arg) {
       ETHOSU_PMU_Enable(drv);
       ETHOSU_PMU_PMCCNTR_CFG_Set_Stop_Event(drv, ETHOSU_PMU_NPU_IDLE);
       ETHOSU_PMU_PMCCNTR_CFG_Set_Start_Event(drv, ETHOSU_PMU_NPU_ACTIVE);
+      uint32_t event_mask = 0;
       for (uint32_t slot = 0; slot < invocation->counter_count; ++slot) {
-        ETHOSU_PMU_Set_EVTYPER(drv, slot, events[slot]);
+        const auto event = events[slot];
+        ETHOSU_PMU_Set_EVTYPER(drv, slot, event);
+        if (event != ETHOSU_PMU_NO_EVENT) {
+          event_mask |= 1u << slot;
+        }
       }
-      const uint32_t event_mask = (1u << invocation->counter_count) - 1u;
+      ETHOSU_PMU_CNTR_Disable(drv, (1u << invocation->counter_count) - 1u);
       ETHOSU_PMU_CNTR_Enable(drv, event_mask | ETHOSU_PMU_CCNT_Msk);
       ETHOSU_PMU_CYCCNT_Reset(drv);
       ETHOSU_PMU_EVCNTR_ALL_Reset(drv);
@@ -135,14 +177,18 @@ void ethosu_inference_end(struct ethosu_driver* drv, void* user_arg) {
     record.success = drv->job.result == ETHOSU_JOB_RESULT_OK;
     record.stats.device_identifier = reinterpret_cast<uintptr_t>(drv->dev.reg);
     record.stats.product = drv->dev.caps.product;
+    record.stats.macs_per_cycle = 1u << drv->dev.caps.log2_macs;
     record.stats.cycle_count = ETHOSU_PMU_Get_CCNTR(drv);
     record.stats.cycle_count_valid = true;
     const uint32_t overflow_status = ETHOSU_PMU_Get_CNTR_OVS(drv);
     record.stats.cycle_overflow = (overflow_status & ETHOSU_PMU_CCNT_Msk) != 0;
-    record.stats.counter_count = invocation->counter_count;
     for (uint32_t slot = 0; slot < invocation->counter_count; ++slot) {
-      record.stats.counters[slot] = {
-          static_cast<uint32_t>(ETHOSU_PMU_Get_EVTYPER(drv, slot)),
+      const auto event = ETHOSU_PMU_Get_EVTYPER(drv, slot);
+      if (event == ETHOSU_PMU_NO_EVENT) {
+        continue;
+      }
+      record.stats.counters[record.stats.counter_count++] = {
+          static_cast<uint32_t>(event),
           ETHOSU_PMU_Get_EVCNTR(drv, slot),
           (overflow_status & (1u << slot)) != 0};
     }
@@ -154,7 +200,7 @@ void ethosu_inference_end(struct ethosu_driver* drv, void* user_arg) {
       uint8_t metadata[executorch::backends::arm::kEthosUCycleMetadataMaxSize]{
           'E', 'U', 'C', '1'};
       write_le32(metadata + 4, record.stats.product);
-      write_le32(metadata + 8, 1u << drv->dev.caps.log2_macs);
+      write_le32(metadata + 8, record.stats.macs_per_cycle);
       write_le32(metadata + 12, static_cast<uint32_t>(record.stats.platform));
       const uint32_t flags =
           (record.stats.cycle_overflow ? 1u : 0u) | (record.success ? 2u : 0u);

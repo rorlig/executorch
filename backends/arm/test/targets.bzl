@@ -62,6 +62,11 @@ def define_arm_tests():
         "ops/test_split.py",
     ]
 
+    # Models
+    test_files += [
+        "models/test_upsample_slice_concat.py",
+    ]
+
     # Modules
     test_files += [
         "modules/test_moe.py",
@@ -123,6 +128,7 @@ def define_arm_tests():
     if runtime.is_oss:
         test_files += [
             "misc/test_docgen_op_support.py",
+            "misc/test_etdump_to_chrome_trace.py",
             "misc/test_public_api_manifest.py",
             "misc/test_validate_public_api_manifest.py",
         ]
@@ -163,7 +169,11 @@ def define_arm_tests():
             ]),
             deps = ([] if runtime.is_oss or not _ENABLE_VGF else [
                 "//executorch/backends/arm/test:model_converter_resource",
-            ]) + [
+            ]) + ([
+                "//executorch/backends/arm/scripts:etdump_to_chrome_trace",
+                "//executorch/devtools/etdump:schema_flatcc",
+                "//executorch/devtools/etdump:serialize",
+            ] if test_name == "etdump_to_chrome_trace" else []) + [
                 "//executorch/backends/arm/test:arm_tester" if runtime.is_oss else "//executorch/backends/arm/test/tester/fb:arm_tester_fb",
                 "//executorch/backends/arm/test:conftest",
                 "//executorch/backends/arm/test:mxfp_test_common",
@@ -202,7 +212,10 @@ def define_arm_tests():
             ] if test_file == "misc/test_version_xfail.py" else []) + ([
                 "//executorch/exir:schema",
                 "//executorch/exir/_serialize:lib",
-            ] if test_file == "misc/test_diff_pte.py" else []),
+            ] if test_file == "misc/test_diff_pte.py" else []) + ([
+                "//executorch/backends/transforms:fuse_identical_input_transforms_pass",
+                "//executorch/backends/transforms:utils",
+            ] if test_file == "passes/test_propagate_permutes_views_pass.py" else []),
         )
 
     runtime.cxx_test(
